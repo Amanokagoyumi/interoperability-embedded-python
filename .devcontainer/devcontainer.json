@@ -46,4 +46,16 @@
         "intersystems.language-server",
 		"intersystems-community.servermanager",
 	],
+	"features": {
+		"ghcr.io/devcontainers/features/github-cli:1": {
+			"installDirectlyFromGitHubRelease": true,
+			"version": "latest"
+		},
+		"ghcr.io/stu-bell/devcontainer-features/node:0": {
+			"nodeGypDependencies": true,
+			"installYarnUsingApt": true,
+			"pnpmVersion": "latest",
+			"nvmVersion": "latest"
+		}
+	},
 }
