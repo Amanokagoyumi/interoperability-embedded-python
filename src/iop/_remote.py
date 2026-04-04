@@ -1,91 +1,456 @@
-# This module provides a REST API for remote I/O operations
-# It uses Flask to handle incoming requests and route them to the appropriate I/O functions
-# It should be able to help the migrate command of IoP Cli to work remotely:
-# this means copy all the .py files from the current directory of (settings.py) to the remote server
-# and run the api migrate from the remote server
-# the default folder is based on the NAMESPACE variable in settings.py
-from flask import Flask, request, jsonify
+"""Remote director: mirrors _Director's interface over the IOP REST API.
 
-@app.route('/remote_io', methods=['POST'])
-def remote_io():
-    data = request.json
-    if not data or 'operation' not in data:
-        return jsonify({'error': 'Invalid request'}), 400
-    
-    operation = data['operation']
-    # Here you would implement the logic to handle the operation
-    # For example, you could call a function that performs the I/O operation
-    # and return the result as JSON.
-    
-    # Placeholder response for demonstration purposes
-    response = {'status': 'success', 'operation': operation}
-    return jsonify(response), 200
+Configure via environment variables:
+    IOP_URL          Required. e.g. http://localhost:8080
+    IOP_USERNAME     Optional. Default: ""
+    IOP_PASSWORD     Optional. Default: ""
+    IOP_NAMESPACE    Optional. Default: "USER"
+    IOP_VERIFY_SSL   Optional. "0"/"false" to disable TLS verification.
 
-# ClassMethod UploadPackage(
-# 	namespace As %String,
-# 	body As %DynamicArray) As %DynamicObject
-# {
-#     // check for namespace existence and user permissions against namespace
-# 	If '..NamespaceCheck(namespace) {
-# 		Return ""
-# 	}
-# 	New $NAMESPACE
-# 	Set $NAMESPACE = namespace
-	
-# 	//Create directory for custom packages
-# 	Do ##class(%ZHSLIB.HealthShareMgr).GetDBNSInfo(namespace,.out)
-# 	Set customPackagesPath = ##class(%Library.File).NormalizeDirectory("fhir_packages", out.globalsDatabase.directory)
-# 	If '##class(%Library.File).DirectoryExists(customPackagesPath) {
-# 		If '##class(%Library.File).CreateDirectory(customPackagesPath) {
-# 			$$$ThrowStatus($$$ERROR($$$DirectoryCannotCreate, customPackagesPath))
-# 		}
-# 	}
-	
-# 	//Find package name
-# 	Set iterator =  body.%GetIterator()
-# 	Set packageName = ""
-# 	While iterator.%GetNext(, .fileObject ) {
-# 		If fileObject.name = "package.json" {
-# 			Set packageName = fileObject.data.name_"@"_fileObject.data.version
-# 		}	
-# 	}
-# 	If packageName = "" {
-# 		Do ..%ReportRESTError($$$HTTP400,$$$ERROR($$$HSFHIRErrPackageNotFound))
-# 		Return ""
-# 	}
-	
-# 	Set packagePath = ##class(%Library.File).NormalizeDirectory(packageName, customPackagesPath)
-# 	// If the package already exists then we must be meaning to re-load it. Delete files/directory/metadata and recreate fresh.
-# 	If ##class(%Library.File).DirectoryExists(packagePath) {
-# 		If '##class(%Library.File).RemoveDirectoryTree(packagePath) {
-# 			$$$ThrowStatus($$$ERROR($$$DirectoryPermission , packagePath))
-# 		}
-# 	}
-# 	If '##class(%Library.File).CreateDirectory(packagePath) {
-# 		$$$ThrowStatus($$$ERROR($$$DirectoryCannotCreate, customPackagesPath))
-# 	}
-# 	Set pkg = ##class(HS.FHIRMeta.Storage.Package).FindById(packageName)
-# 	If $ISOBJECT(pkg) {
-# 		// Will fail and throw if the package is in-use or has dependencies preventing it from being deleted.
-# 		Do ##class(HS.FHIRServer.ServiceAdmin).DeleteMetadataPackage(packageName)
-# 	}
-# 	Kill pkg
+Or pass a RemoteSettings dict directly (same shape as REMOTE_SETTINGS in settings.py).
+"""
 
-# 	//Unpack JSON objects		
-# 	Set iterator = body.%GetIterator()
-# 	While iterator.%GetNext(.key , .fileObject ) {
-# 		Set fileName = ##class(%Library.File).NormalizeFilename(fileObject.name,packagePath)
-# 		Set fileStream = ##class(%Stream.FileCharacter).%New()
-# 		Set fileStream.TranslateTable = "UTF8"
-# 		$$$ThrowOnError(fileStream.LinkToFile(fileName))
-# 		Do fileObject.data.%ToJSON(.fileStream)
-# 		$$$ThrowOnError(fileStream.%Save())
-# 	}
-	
-# 	//Import package
-# 	Do ##class(HS.FHIRMeta.Load.NpmLoader).importPackages(packagePath)
-# 	Set pkg = ..GetOnePackage(packageName, namespace)
-# 	Do ..%SetStatusCode($$$HTTP201)
-# 	Do ..%SetHeader("location", %request.Application _ "packages/" _ packageName _ "?namespace=" _ namespace)
-# 	Return pkg
-# }
+from __future__ import annotations
+
+import json
+import os
+import signal
+import time
+from typing import Any, Dict, List, Optional
+
+import requests
+import urllib3
+
+from ._director_protocol import DirectorProtocol as _DirectorProtocol  # noqa: F401 --- IGNORE ---
+
+class _RemoteDirector(_DirectorProtocol):
+    """Implements DirectorProtocol over the IOP REST API."""
+
+    def __init__(self, remote_settings: Dict[str, Any]) -> None:
+        self._url = remote_settings["url"].rstrip("/")
+        self._base = self._url + "/api/iop"
+        self._auth = (
+            remote_settings.get("username", ""),
+            remote_settings.get("password", ""),
+        )
+        self._namespace: str = remote_settings.get("namespace", "USER")
+        self._verify: bool = remote_settings.get("verify_ssl", True)
+        if not self._verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _raise_for_status(resp: requests.Response) -> None:
+        """Like resp.raise_for_status() but includes the response body error message."""
+        if not resp.ok:
+            try:
+                body = resp.json()
+                error = body.get("error") or body.get("message") or resp.text
+            except Exception:
+                error = resp.text or resp.reason
+            raise requests.exceptions.HTTPError(
+                f"{resp.status_code} {resp.reason}: {error}",
+                response=resp,
+            )
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        p = {"namespace": self._namespace, **(params or {})}
+        resp = requests.get(
+            f"{self._base}{path}", params=p, auth=self._auth,
+            verify=self._verify, timeout=30,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def _post(self, path: str, body: Optional[dict] = None) -> Any:
+        resp = requests.post(
+            f"{self._base}{path}", json=(body or {}),
+            params={"namespace": self._namespace},
+            auth=self._auth, verify=self._verify, timeout=30,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def _put(self, path: str, body: Optional[dict] = None) -> Any:
+        resp = requests.put(
+            f"{self._base}{path}", json=(body or {}),
+            params={"namespace": self._namespace},
+            auth=self._auth, verify=self._verify, timeout=30,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def _check_error(self, data: Any) -> Any:
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(data["error"])
+        return data
+
+    # ------------------------------------------------------------------
+    # Production lifecycle
+    # ------------------------------------------------------------------
+
+    def get_default_production(self) -> str:
+        data = self._check_error(self._get("/default"))
+        return data.get("production") or "Not defined"
+
+    def set_default_production(self, production_name: str = "") -> None:
+        self._check_error(self._put("/default", {"production": production_name}))
+
+    def list_productions(self) -> dict:
+        return self._check_error(self._get("/list"))
+
+    def status_production(self) -> dict:
+        data = self._check_error(self._get("/status"))
+        if not data.get("production"):
+            data["production"] = self.get_default_production()
+        return data
+
+    def start_production(self, production_name: Optional[str] = None) -> None:
+        body: dict = {}
+        if production_name:
+            body["production"] = production_name
+        self._check_error(self._post("/start", body))
+
+    def start_production_with_log(self, production_name: Optional[str] = None) -> None:
+        """Start remotely then stream the log until Ctrl-C (which also stops)."""
+        self.start_production(production_name)
+        prod = production_name or self.get_default_production()
+        print(f"Production '{prod}' started. Streaming log — Ctrl-C to stop.")
+        running = True
+
+        def _sigint(sig, frame):  # pragma: no cover
+            nonlocal running
+            running = False
+
+        signal.signal(signal.SIGINT, _sigint)
+
+        last_id = 0
+        for entry in self._get_log_entries(top=10):
+            _print_log_entry(entry)
+            last_id = max(last_id, entry.get("id", 0))
+
+        while running:
+            time.sleep(1)
+            entries = self._get_log_entries(since_id=last_id)
+            for entry in entries:
+                _print_log_entry(entry)
+                last_id = max(last_id, entry.get("id", 0))
+
+        self.stop_production()
+
+    def stop_production(self) -> None:
+        self._check_error(self._post("/stop"))
+
+    def shutdown_production(self) -> None:
+        self._check_error(self._post("/kill"))
+
+    def restart_production(self) -> None:
+        self._check_error(self._post("/restart"))
+
+    def update_production(self) -> None:
+        self._check_error(self._post("/update"))
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _get_log_entries(
+        self,
+        top: int = 10,
+        since_id: Optional[int] = None,
+    ) -> List[dict]:
+        params: dict = {}
+        if since_id is not None:
+            params["since_id"] = since_id
+        else:
+            params["top"] = top
+        data = self._check_error(self._get("/log", params))
+        return data if isinstance(data, list) else []
+
+    def log_production_top(self, top: int = 10) -> None:
+        entries = self._get_log_entries(top=top)
+        for entry in reversed(entries):
+            _print_log_entry(entry)
+
+    def log_production(self) -> None:
+        """Stream log continuously until Ctrl-C."""
+        running = True
+
+        def _sigint(sig, frame):  # pragma: no cover
+            nonlocal running
+            running = False
+
+        signal.signal(signal.SIGINT, _sigint)
+
+        last_id = 0
+        for entry in self._get_log_entries(top=10):
+            _print_log_entry(entry)
+            last_id = max(last_id, entry.get("id", 0))
+
+        while running:
+            time.sleep(1)
+            entries = self._get_log_entries(since_id=last_id)
+            for entry in entries:
+                _print_log_entry(entry)
+                last_id = max(last_id, entry.get("id", 0))
+
+    # ------------------------------------------------------------------
+    # Test
+    # ------------------------------------------------------------------
+
+    def test_component(
+        self,
+        target: Optional[str],
+        message=None,           # ignored remotely — not serialisable over HTTP
+        classname: Optional[str] = None,
+        body: "str | dict | None" = None,
+        restart: bool = True,
+    ) -> dict:
+        """Returns a dict: {"classname": "...", "body": "...", "truncated": false}.
+
+        If *restart* is True the target component is stopped and restarted on
+        the server before the test message is dispatched.
+        """
+        payload: dict = {"target": target or ""}
+        if classname:
+            payload["classname"] = classname
+        if body is not None:
+            payload["body"] = body
+        if restart:
+            payload["restart"] = True
+        try:
+            return self._check_error(self._post("/test", payload))
+        except requests.exceptions.HTTPError as exc:
+            try:
+                err_msg = exc.response.json().get("error", str(exc))
+            except Exception:
+                err_msg = str(exc)
+            raise RuntimeError(err_msg) from exc
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_production(self, production_name: str) -> dict:
+        return self._check_error(
+            self._get("/export", {"production": production_name})
+        )
+
+    # ------------------------------------------------------------------
+    # Migrate
+    # ------------------------------------------------------------------
+
+    def migrate(self, path: str) -> None:
+        """Upload .py and .cls files from *path*'s folder to remote IRIS via the IOP migrate API.
+
+        *path* must be an absolute path to a ``settings.py`` file whose directory
+        (and sub-directories) will be walked for ``.py`` / ``.cls`` files.
+        ``REMOTE_SETTINGS`` fields (package, namespace, remote_folder) are read
+        from that same settings file when present; otherwise the director's own
+        namespace / defaults are used.
+        """
+        import importlib.util
+
+        folder = os.path.dirname(path)
+
+        # Try to read optional keys from the settings file
+        package = 'python'
+        remote_folder = ''
+        try:
+            spec = importlib.util.spec_from_file_location('_iop_migrate_settings', path)
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            rs = getattr(mod, 'REMOTE_SETTINGS', {})
+            package = rs.get('package', package)
+            remote_folder = rs.get('remote_folder', remote_folder)
+        except Exception:
+            pass
+
+        body: List[dict] = []
+        for dirpath, _, filenames in os.walk(folder):
+            for fname in sorted(filenames):
+                if not (fname.endswith('.py') or fname.endswith('.cls')):
+                    continue
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, folder).replace(os.sep, '/')
+                with open(full, encoding='utf-8') as fh:
+                    body.append({'name': rel, 'data': fh.read()})
+
+        payload = {
+            'namespace': self._namespace,
+            'package': package,
+            'remote_folder': remote_folder,
+            'body': body,
+        }
+        resp = requests.put(
+            f"{self._base}/migrate",
+            json=payload,
+            params={"namespace": self._namespace},
+            auth=self._auth,
+            verify=self._verify,
+            timeout=30,
+        )
+        self._raise_for_status(resp)
+        # Server returns $$$OK (the integer 1) on success — not meaningful to print
+
+    # ------------------------------------------------------------------
+    # Init / setup — uploads .cls files via the Atelier API
+    # ------------------------------------------------------------------
+
+    def setup(self, path: Optional[str] = None) -> None:
+        """Upload and compile IOP .cls files to remote IRIS via the Atelier REST API.
+
+        When *path* is ``None`` the bundled ``iop/cls/`` directory (and the
+        optional ``grongier/cls/`` directory for retrocompatibility) is used.
+        Any explicit *path* must point to a directory containing ``.cls`` files.
+        """
+        import importlib.resources
+
+        paths_to_upload: List[str] = []
+        if path is None:
+            try:
+                paths_to_upload.append(
+                    str(importlib.resources.files('iop').joinpath('cls'))
+                )
+            except ModuleNotFoundError:
+                pass
+            try:  # retrocompatibility with the grongier.pex package
+                paths_to_upload.append(
+                    str(importlib.resources.files('grongier').joinpath('cls'))
+                )
+            except ModuleNotFoundError:
+                pass
+        else:
+            paths_to_upload.append(path)
+
+        atelier_base = f"{self._url}/api/atelier/v1"
+        doc_names: List[str] = []
+
+        for cls_root in paths_to_upload:
+            for dirpath, _, filenames in os.walk(cls_root):
+                for fname in sorted(filenames):
+                    if not fname.endswith('.cls'):
+                        continue
+                    full_path = os.path.join(dirpath, fname)
+                    doc_name = os.path.relpath(full_path, cls_root).replace(os.sep, '.').replace('/', '.')
+                    with open(full_path, encoding='utf-8') as fh:
+                        content = fh.read().splitlines()
+                    resp = requests.put(
+                        f"{atelier_base}/{self._namespace}/doc/{doc_name}",
+                        json={"enc": False, "content": content},
+                        params={"ignoreConflict": "1"},
+                        auth=self._auth,
+                        verify=self._verify,
+                        timeout=30,
+                    )
+                    self._raise_for_status(resp)
+                    doc_names.append(doc_name)
+                    print(f"Uploaded: {doc_name}")
+
+        if not doc_names:
+            raise RuntimeError("No .cls files found to upload.")
+
+        # Compile all uploaded documents in one request
+        resp = requests.post(
+            f"{atelier_base}/{self._namespace}/action/compile",
+            json=doc_names,
+            params={"flags": "cuk"},
+            auth=self._auth,
+            verify=self._verify,
+            timeout=120,
+        )
+        self._raise_for_status(resp)
+        result = resp.json()
+        for line in result.get('console', []):
+            if line:
+                print(line)
+        errors = result.get('status', {}).get('errors', [])
+        if errors:
+            raise RuntimeError(f"Compilation errors: {errors}")
+        print(
+            "\n.cls files uploaded and compiled successfully."
+            "\nNext step: ensure the 'iop' Python package is installed on the IRIS server:"
+            "\n  python3 -m pip install iris-pex-embedded-python"
+            "\nThis is required for full IOP Support; without it, only the migrate() and export_production() methods will work remotely."
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+
+# ------------------------------------------------------------------
+# Shared helpers
+# ------------------------------------------------------------------
+
+def _print_log_entry(entry: dict) -> None:
+    print(
+        entry.get("time_logged", ""),
+        entry.get("type", ""),
+        entry.get("config_name", ""),
+        entry.get("job", ""),
+        entry.get("message_id", ""),
+        entry.get("session_id", ""),
+        entry.get("source_class", ""),
+        entry.get("source_method", ""),
+        entry.get("text", ""),
+    )
+
+
+def _load_remote_settings_from_file(settings_path: str) -> Optional[Dict[str, Any]]:
+    """Load a ``REMOTE_SETTINGS`` dict from an arbitrary settings.py file."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_iop_settings_remote", settings_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        remote = getattr(mod, "REMOTE_SETTINGS", None)
+        if isinstance(remote, dict) and "url" in remote:
+            return remote
+    except Exception:
+        pass
+    return None
+
+
+def get_remote_settings(
+    explicit_settings_path: Optional[str] = None,
+    fallback_settings_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect remote settings from the environment or an explicit file.
+
+    Priority:
+    1. ``IOP_URL`` env var (direct inline configuration).
+    2. ``explicit_settings_path`` — the file supplied via ``--remote-settings``.
+    3. ``IOP_SETTINGS`` env var pointing to a settings.py with ``REMOTE_SETTINGS``.
+    4. ``fallback_settings_path`` — e.g. the file passed via ``-m settings.py``;
+       its ``REMOTE_SETTINGS`` dict is used when present.
+    """
+    url = os.environ.get("IOP_URL")
+    if url:
+        verify_raw = os.environ.get("IOP_VERIFY_SSL", "1")
+        return {
+            "url": url,
+            "username": os.environ.get("IOP_USERNAME", ""),
+            "password": os.environ.get("IOP_PASSWORD", ""),
+            "namespace": os.environ.get("IOP_NAMESPACE", "USER"),
+            "verify_ssl": verify_raw.lower() not in ("0", "false"),
+        }
+
+    for path in filter(None, [
+        explicit_settings_path,
+        os.environ.get("IOP_SETTINGS"),
+        fallback_settings_path,
+    ]):
+        result = _load_remote_settings_from_file(path)
+        if result:
+            return result
+
+    return None
+

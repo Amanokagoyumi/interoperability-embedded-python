@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- `iop` command line has a new full remote controle feature, allowing to start, stop, restart, update, test and log productions on a remote IRIS instance through its REST API
+  
+### Fixed
+- Review how sys.path is updated by Common.cls to ensure it works correctly in all environments
+
+### Changed
+- Refactor whole unittest and e2e test suite for better maintainability and reliability
+- Export production now returns Production name as key in the returned dict for better clarity
+
 ## [3.5.5] - 2026-01-23
 ### Added
 - Add `iop --update` command to update a production from the command line

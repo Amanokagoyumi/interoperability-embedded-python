@@ -15,7 +15,9 @@ dist
 build
 waitISC.log
 .env
+.env.remote
 
 prof
 src/tests/bench/result.txt
 .coverage
+src/tests/e2e/local/bench/result.txt
