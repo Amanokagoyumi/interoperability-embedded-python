@@ -5,6 +5,12 @@ COPY --chown=irisowner:irisowner . /irisdev/app
 
 WORKDIR /irisdev/app
 
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends curl sudo gh \
+	&& echo 'irisowner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/irisowner \
+	&& chmod 0440 /etc/sudoers.d/irisowner \
+	&& rm -rf /var/lib/apt/lists/*
+
 # map the source code of iop into iris python lib
 RUN ln -s /irisdev/app/src/iop /usr/irissys/mgr/python/iop
 # for retrocompatibility

@@ -3,6 +3,12 @@ FROM $IMAGE
 
 WORKDIR /irisdev/app
 
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends curl sudo gh \
+	&& echo 'irisowner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/irisowner \
+	&& chmod 0440 /etc/sudoers.d/irisowner \
+	&& rm -rf /var/lib/apt/lists/*
+
 ## Python stuff
 ARG IRISUSERNAME
 ARG IRISPASSWORD
