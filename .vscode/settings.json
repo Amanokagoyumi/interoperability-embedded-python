@@ -8,7 +8,11 @@
       "ns": "IRISAPP",
       "username": "_IRIS_USERNAME_",
       "password": "_IRIS_PASSWORD_",
-      "active": true,
+      "docker-compose": {
+        "service": "iris",
+        "internalPort": 52773
+      },
+      "active": false,
       "links": {
         "Production": "http://localhost:${port}/csp/irisapp/EnsPortal.ProductionConfig.zen?PRODUCTION=PEX.Production"
       },
